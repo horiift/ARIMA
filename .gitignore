@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories
+1-ARIMA/
+
+# Virtual environments
+venv/
+.venv/
+env/

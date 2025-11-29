@@ -67,6 +67,10 @@ def extract_wd_from_label(col: str) -> str | None:
     except Exception:
         return None
 
+def format_return_pct(v):
+    """Efficiently format return value as percentage string."""
+    return "" if pd.isna(v) else f"{v:.2f}%"
+
 def build_diverging_cmap():
     return LinearSegmentedColormap.from_list(
         "vermelho_branco_azul",
@@ -77,7 +81,7 @@ def build_diverging_cmap():
 def detect_horizons(columns, prefix):
     escaped = re.escape(prefix)
     pattern = re.compile(rf"^{escaped}t\+(\d+)$")
-    return sorted([int(m.group(1)) for c in columns if (m := pattern.match(c))])
+    return sorted({int(m.group(1)) for c in columns if (m := pattern.match(c))})
 
 def product_return(returns: pd.Series) -> float:
     # Filter out NaN values using vectorized operation
@@ -108,9 +112,16 @@ def make_norm(values):
     return TwoSlopeNorm(vmin=-span, vcenter=0.0, vmax=span)
 
 def compute_comp_metric(df_terms: pd.DataFrame, label: str):
+    if df_terms.empty:
+        return pd.DataFrame()
+    
+    # Pre-sort once rather than sorting within each group
+    df_sorted = df_terms.sort_values(["window_days", "target_date", "horizon_h"])
+    
     records = []
-    for w, group in df_terms.groupby("window_days"):
-        comp_ret = product_return(group.sort_values(["target_date", "horizon_h"])["return_value"])
+    for w, group in df_sorted.groupby("window_days", sort=False):
+        # Group is already sorted by target_date, horizon_h due to pre-sorting
+        comp_ret = product_return(group["return_value"])
         records.append({
             "window_days": w,
             label: comp_ret,
@@ -202,12 +213,18 @@ def compute_btc_appreciation(dsel: pd.DataFrame):
         "appreciation_pct": (p1 / p0 - 1.0) * 100.0
     }
 
-def compute_appreciation_between_dates(dsel: pd.DataFrame, date_open: pd.Timestamp | None, date_close: pd.Timestamp | None) -> float | None:
+def build_open_map(dsel: pd.DataFrame) -> pd.Series:
+    """Build a lookup map from date to open price, created once for efficiency."""
+    if "open_t" not in dsel.columns:
+        return pd.Series(dtype=float)
+    return dsel.drop_duplicates(subset=["date"]).set_index("date")["open_t"]
+
+def compute_appreciation_between_dates(date_open: pd.Timestamp | None, date_close: pd.Timestamp | None, open_map: pd.Series) -> float | None:
+    """Compute appreciation between two dates using pre-built open_map."""
     if date_open is None or date_close is None:
         return None
-    if "open_t" not in dsel.columns:
+    if open_map.empty:
         return None
-    open_map = dsel.drop_duplicates(subset=["date"]).set_index("date")["open_t"]
     if date_open not in open_map.index or date_close not in open_map.index:
         return None
     p0 = open_map.loc[date_open]; p1 = open_map.loc[date_close]
@@ -260,18 +277,23 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
 
     uniform_base_cutoff = validation_end - pd.Timedelta(days=7)
 
+    # Pre-sort dsel once for better performance
+    dsel_sorted = dsel.sort_values(["dow", "date"])
+    
+    # Pre-filter data by cutoff to avoid repeated filtering in loop
+    dsel_before_cutoff = dsel_sorted[dsel_sorted["date"] < uniform_base_cutoff]
+    
+    # Pre-compute grouped data by dow for efficient lookup
+    grouped_by_dow = {idx: group for idx, group in dsel_before_cutoff.groupby("dow")}
+    
     candidate_base_dates = {}
     for idx, wd in enumerate(WEEKDAY_NAMES):
-        day_all = dsel[dsel["dow"] == idx]
-        if day_all.empty:
-            candidate_base_dates[wd] = []
-            continue
-        day_f = day_all[day_all["date"] < uniform_base_cutoff].sort_values("date")
-        if day_f.empty:
+        day_f = grouped_by_dow.get(idx)
+        if day_f is None or day_f.empty:
             candidate_base_dates[wd] = []
             continue
         full_rows = day_f[(day_f["date"] + pd.Timedelta(days=7)) <= validation_end]
-        candidate_base_dates[wd] = list(full_rows["date"].sort_values())
+        candidate_base_dates[wd] = list(full_rows["date"])
 
     counts = {wd: len(lst) for wd, lst in candidate_base_dates.items()}
     counts_except_mon_tue = [counts[w] for w in WEEKDAY_NAMES if w not in ["Mon", "Tue"]]
@@ -282,6 +304,10 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
     last_weekly_target_dates = {}
     weekly_comp_series = {}
 
+    # Pre-compute grouped data by dow for the full dataset (sorted for efficiency)
+    dsel_full_sorted = dsel.sort_values(["window_days", "date"])
+    grouped_full_by_dow = {idx: group for idx, group in dsel_full_sorted.groupby("dow")}
+
     if target_count > 0:
         for idx, wd in enumerate(WEEKDAY_NAMES):
             base_list = candidate_base_dates[wd]
@@ -290,7 +316,13 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
                 last_weekly_target_dates[wd] = None
                 continue
             sel = base_list[:target_count]
-            subset = dsel[(dsel["dow"] == idx) & (dsel["date"].isin(sel))].sort_values(["window_days", "date"])
+            sel_set = set(sel)  # Use set for O(1) membership testing
+            full_group = grouped_full_by_dow.get(idx)
+            if full_group is None:
+                first_weekly_base_dates[wd] = None
+                last_weekly_target_dates[wd] = None
+                continue
+            subset = full_group[full_group["date"].isin(sel_set)]
             weekly_terms = build_terms_weekly_for_day(subset, retrain_horizons, cutoff_target)
             weekly_terms.to_csv(os.path.join(csv_dir, f"{wd}_semanal_termos_uniforme.csv"), index=False)
             if sel:
@@ -321,13 +353,16 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
         ret_diario_heat = comp_ret_diario.set_index("window_days")[["Retreino Diário (+1) (%)"]].sort_index(ascending=False)
         comp_ret_diario.to_csv(os.path.join(csv_dir, f"{start_weekday_name}_retreino_diario_resumo.csv"), index=False)
 
+    # Build open_map once for efficient appreciation lookups
+    open_map = build_open_map(dsel)
+    
     btc_semanal_numeric = {}
     btc_semanal_str = {}
     for wd in WEEKDAY_NAMES:
         o = first_weekly_base_dates.get(wd)
         c = last_weekly_target_dates.get(wd)
         if o is not None and c is not None:
-            pct = compute_appreciation_between_dates(dsel, pd.Timestamp(o), pd.Timestamp(c))
+            pct = compute_appreciation_between_dates(pd.Timestamp(o), pd.Timestamp(c), open_map)
             btc_semanal_numeric[wd] = pct if pct is not None else np.nan
             btc_semanal_str[wd] = f"{pct:+.2f}%" if pct is not None else ""
         else:
@@ -335,7 +370,7 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
             btc_semanal_str[wd] = ""
 
     if stop_date_start_wd is not None:
-        btc_ret_diario_pct = compute_appreciation_between_dates(dsel, validation_start, pd.Timestamp(stop_date_start_wd))
+        btc_ret_diario_pct = compute_appreciation_between_dates(validation_start, pd.Timestamp(stop_date_start_wd), open_map)
         ret_diario_pct_numeric = btc_ret_diario_pct if btc_ret_diario_pct is not None else np.nan
         ret_diario_btc_str = f"{btc_ret_diario_pct:+.2f}%" if btc_ret_diario_pct is not None else ""
     else:
@@ -407,7 +442,7 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
         ax_main.axis("off")
     else:
         norm_main = make_norm(combined_heat.values.flatten())
-        annot_main = combined_heat.map(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
+        annot_main = combined_heat.map(format_return_pct)
         sns.heatmap(combined_heat, cmap=cmap, norm=norm_main,
                     annot=annot_main, fmt="", linewidths=0.5, linecolor="gray",
                     cbar=False, ax=ax_main)
@@ -421,20 +456,21 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
     if combined_heat.empty:
         ax_diff.axis("off")
     else:
-        btc_map_numeric = {}
-        for col in combined_heat.columns:
-            if is_semanal_label(col):
-                wd_internal = extract_wd_from_label(col)
-                btc_map_numeric[col] = btc_semanal_numeric.get(wd_internal, np.nan)
-            elif col == "Retreino Diário (+1)":
-                btc_map_numeric[col] = ret_diario_pct_numeric
-            else:
-                btc_map_numeric[col] = np.nan
-        diff_heat = combined_heat.copy()
-        for col in diff_heat.columns:
-            diff_heat[col] = diff_heat[col] - btc_map_numeric.get(col, np.nan)
+        # Build btc_map_numeric using dict comprehension for efficiency
+        btc_map_numeric = {
+            col: (
+                btc_semanal_numeric.get(extract_wd_from_label(col), np.nan)
+                if is_semanal_label(col)
+                else (ret_diario_pct_numeric if col == "Retreino Diário (+1)" else np.nan)
+            )
+            for col in combined_heat.columns
+        }
+        # Use vectorized subtraction with pd.Series for better performance
+        btc_values = pd.Series([btc_map_numeric.get(col, np.nan) for col in combined_heat.columns], 
+                               index=combined_heat.columns)
+        diff_heat = combined_heat.subtract(btc_values, axis=1)
         norm_diff = make_norm(diff_heat.values.flatten())
-        annot_diff = diff_heat.map(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
+        annot_diff = diff_heat.map(format_return_pct)
         sns.heatmap(diff_heat, cmap=cmap, norm=norm_diff,
                     annot=annot_diff, fmt="", linewidths=0.5, linecolor="gray",
                     cbar=False, ax=ax_diff)

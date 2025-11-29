@@ -79,10 +79,14 @@ def product_return(returns: pd.Series) -> float:
         return 0.0
     # Check for catastrophic loss using vectorized comparison
     if (valid_returns <= -0.999999).any():
-        # Capital goes to 0 after catastrophic loss (original behavior)
+        # Capital goes to 0 after catastrophic loss (original behavior: (0-1)*100 = -100)
         return -100.0
-    # Vectorized computation of cumulative product
-    capital = np.prod(1 + valid_returns.values)
+    # Use log-sum-exp for numerical stability with many small returns
+    factors = 1 + valid_returns.values
+    # Avoid log of negative or zero values
+    if (factors <= 0).any():
+        return -100.0
+    capital = np.exp(np.sum(np.log(factors)))
     return (capital - 1.0) * 100.0
 
 def make_norm(values):

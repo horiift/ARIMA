@@ -34,6 +34,8 @@ DISPLAY_WEEKDAY_MAP = {
     "Sat": "Sáb",
     "Sun": "Dom",
 }
+# Pre-compute inverse map once instead of rebuilding in each function call
+INVERSE_DISPLAY_WEEKDAY_MAP = {v: k for k, v in DISPLAY_WEEKDAY_MAP.items()}
 
 def semanal_label(wd_internal: str) -> str:
     """Retorna o rótulo multi-linha para a coluna semanal de um dia interno."""
@@ -53,9 +55,8 @@ def extract_wd_from_label(col: str) -> str | None:
         inside = col.split("\n", 1)[1]  # (Seg +7)
         inside = inside.strip("()")     # Seg +7
         abbrev = inside.split("+7")[0].strip()  # Seg
-        # Mapear 'Seg' -> internal 'Mon'
-        inv_map = {v: k for k, v in DISPLAY_WEEKDAY_MAP.items()}
-        return inv_map.get(abbrev)
+        # Use pre-computed inverse map for better performance
+        return INVERSE_DISPLAY_WEEKDAY_MAP.get(abbrev)
     except Exception:
         return None
 
@@ -69,22 +70,30 @@ def build_diverging_cmap():
 def detect_horizons(columns, prefix):
     escaped = re.escape(prefix)
     pattern = re.compile(rf"^{escaped}t\+(\d+)$")
-    horizons = []
-    for c in columns:
-        m = pattern.match(c)
-        if m:
-            horizons.append(int(m.group(1)))
-    return sorted(horizons)
+    return sorted([int(m.group(1)) for c in columns if (m := pattern.match(c))])
 
 def product_return(returns: pd.Series) -> float:
-    capital = 1.0
-    for r in returns:
-        if pd.isna(r):
-            continue
-        if r <= -0.999999:
-            capital = 0.0
-            break
-        capital *= (1 + r)
+    # Filter out NaN values using vectorized operation
+    valid_returns = returns.dropna()
+    if valid_returns.empty:
+        return 0.0
+    # Check for catastrophic loss using vectorized comparison
+    if (valid_returns <= -0.999999).any():
+        # Find the first index where catastrophic loss occurs
+        catastrophic_mask = valid_returns <= -0.999999
+        first_catastrophic_idx = catastrophic_mask.idxmax() if catastrophic_mask.any() else None
+        if first_catastrophic_idx is not None:
+            # Compute product only up to the catastrophic loss
+            pre_catastrophic = valid_returns.loc[:first_catastrophic_idx]
+            if len(pre_catastrophic) <= 1:
+                return -100.0
+            # Exclude the catastrophic value itself, compute product then multiply by 0
+            pre_catastrophic = pre_catastrophic.iloc[:-1]
+            if pre_catastrophic.empty:
+                return -100.0
+            return -100.0  # Capital goes to 0 after catastrophic loss
+    # Vectorized computation of cumulative product
+    capital = np.prod(1 + valid_returns.values)
     return (capital - 1.0) * 100.0
 
 def make_norm(values):
@@ -110,28 +119,40 @@ def compute_comp_metric(df_terms: pd.DataFrame, label: str):
     return pd.DataFrame(records).set_index("window_days")
 
 def build_terms_weekly_for_day(group_df, retrain_horizons, cutoff_target):
-    rows = []
     h_full = 7
     if h_full not in retrain_horizons:
-        return pd.DataFrame(rows)
-    for _, row in group_df.iterrows():
-        base_date = row["date"]
-        target_full = base_date + pd.Timedelta(days=h_full)
-        if target_full > (cutoff_target - pd.Timedelta(days=1)):
-            continue
-        r = row.get(f"return_retrain_t+{h_full}", np.nan)
-        if pd.isna(r):
-            continue
-        rows.append({
-            "window_days": int(row["window_days"]),
-            "base_date": base_date.date().isoformat(),
-            "horizon_h": h_full,
-            "target_date": target_full.date().isoformat(),
-            "return_value": float(r),
-            "factor": 1.0 + float(r),
-            "source": "validacao_semanal"
-        })
-    return pd.DataFrame(rows)
+        return pd.DataFrame()
+    if group_df.empty:
+        return pd.DataFrame()
+    
+    # Vectorized approach: compute all target dates at once
+    return_col = f"return_retrain_t+{h_full}"
+    if return_col not in group_df.columns:
+        return pd.DataFrame()
+    
+    df = group_df.copy()
+    df["target_full"] = df["date"] + pd.Timedelta(days=h_full)
+    cutoff_limit = cutoff_target - pd.Timedelta(days=1)
+    
+    # Filter rows using vectorized operations
+    mask = (df["target_full"] <= cutoff_limit) & df[return_col].notna()
+    filtered = df.loc[mask]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Build result DataFrame using vectorized operations
+    result = pd.DataFrame({
+        "window_days": filtered["window_days"].astype(int),
+        "base_date": filtered["date"].dt.date.astype(str),
+        "horizon_h": h_full,
+        "target_date": filtered["target_full"].dt.date.astype(str),
+        "return_value": filtered[return_col].astype(float),
+        "factor": 1.0 + filtered[return_col].astype(float),
+        "source": "validacao_semanal"
+    })
+    
+    return result
 
 def build_terms_ret_diario(dsel, stop_date):
     if stop_date is None or "return_daily_t+1" not in dsel.columns:
@@ -141,25 +162,30 @@ def build_terms_ret_diario(dsel, stop_date):
     subset = dsel[(dsel["date"] >= validation_start) & (dsel["date"] <= max_base_date)].sort_values(["window_days", "date"])
     if subset.empty:
         return pd.DataFrame()
-    rows = []
-    for _, row in subset.iterrows():
-        base_date = row["date"]
-        target_date = base_date + pd.Timedelta(days=1)
-        if target_date.date() > stop_date:
-            continue
-        r = row.get("return_daily_t+1", np.nan)
-        if pd.isna(r):
-            continue
-        rows.append({
-            "window_days": int(row["window_days"]),
-            "base_date": base_date.date().isoformat(),
-            "horizon_h": 1,
-            "target_date": target_date.date().isoformat(),
-            "return_value": float(r),
-            "factor": 1.0 + float(r),
-            "source": "ret_diario"
-        })
-    return pd.DataFrame(rows)
+    
+    # Vectorized approach: compute all target dates at once
+    df = subset.copy()
+    df["target_date_ts"] = df["date"] + pd.Timedelta(days=1)
+    
+    # Filter rows using vectorized operations
+    mask = (df["target_date_ts"].dt.date <= stop_date) & df["return_daily_t+1"].notna()
+    filtered = df.loc[mask]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Build result DataFrame using vectorized operations
+    result = pd.DataFrame({
+        "window_days": filtered["window_days"].astype(int),
+        "base_date": filtered["date"].dt.date.astype(str),
+        "horizon_h": 1,
+        "target_date": filtered["target_date_ts"].dt.date.astype(str),
+        "return_value": filtered["return_daily_t+1"].astype(float),
+        "factor": 1.0 + filtered["return_daily_t+1"].astype(float),
+        "source": "ret_diario"
+    })
+    
+    return result
 
 def compute_btc_appreciation(dsel: pd.DataFrame):
     if "open_t" not in dsel.columns:
@@ -382,7 +408,7 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
         ax_main.axis("off")
     else:
         norm_main = make_norm(combined_heat.values.flatten())
-        annot_main = combined_heat.applymap(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
+        annot_main = combined_heat.map(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
         sns.heatmap(combined_heat, cmap=cmap, norm=norm_main,
                     annot=annot_main, fmt="", linewidths=0.5, linecolor="gray",
                     cbar=False, ax=ax_main)
@@ -409,7 +435,7 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
         for col in diff_heat.columns:
             diff_heat[col] = diff_heat[col] - btc_map_numeric.get(col, np.nan)
         norm_diff = make_norm(diff_heat.values.flatten())
-        annot_diff = diff_heat.applymap(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
+        annot_diff = diff_heat.map(lambda v: "" if pd.isna(v) else f"{v:.2f}%")
         sns.heatmap(diff_heat, cmap=cmap, norm=norm_diff,
                     annot=annot_diff, fmt="", linewidths=0.5, linecolor="gray",
                     cbar=False, ax=ax_diff)

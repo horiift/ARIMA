@@ -98,7 +98,8 @@ def main():
     rows = []
     eval_dates = s_pos.index[(s_pos.index >= start_date) & (s_pos.index <= end_date)]
 
-    # Optimization: Convert Series to dict for O(1) lookups instead of O(n) index checks
+    # Optimization: Convert Series to dict for O(1) lookups instead of O(n) index checks.
+    # This trades memory for speed - suitable for typical BTC daily data sizes.
     s_pos_dict = s_pos.to_dict()
 
     for current_day in eval_dates:
@@ -107,7 +108,8 @@ def main():
         if len(train_series_log) < 2:
             continue
 
-        open_t = s_pos_dict.get(current_day, np.nan)
+        # current_day is guaranteed to exist in s_pos_dict (comes from eval_dates filtered from s_pos.index)
+        open_t = s_pos_dict[current_day]
         if not np.isfinite(open_t) or open_t <= 0:
             continue
 

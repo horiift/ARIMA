@@ -79,19 +79,8 @@ def product_return(returns: pd.Series) -> float:
         return 0.0
     # Check for catastrophic loss using vectorized comparison
     if (valid_returns <= -0.999999).any():
-        # Find the first index where catastrophic loss occurs
-        catastrophic_mask = valid_returns <= -0.999999
-        first_catastrophic_idx = catastrophic_mask.idxmax() if catastrophic_mask.any() else None
-        if first_catastrophic_idx is not None:
-            # Compute product only up to the catastrophic loss
-            pre_catastrophic = valid_returns.loc[:first_catastrophic_idx]
-            if len(pre_catastrophic) <= 1:
-                return -100.0
-            # Exclude the catastrophic value itself, compute product then multiply by 0
-            pre_catastrophic = pre_catastrophic.iloc[:-1]
-            if pre_catastrophic.empty:
-                return -100.0
-            return -100.0  # Capital goes to 0 after catastrophic loss
+        # Capital goes to 0 after catastrophic loss (original behavior)
+        return -100.0
     # Vectorized computation of cumulative product
     capital = np.prod(1 + valid_returns.values)
     return (capital - 1.0) * 100.0
@@ -130,13 +119,14 @@ def build_terms_weekly_for_day(group_df, retrain_horizons, cutoff_target):
     if return_col not in group_df.columns:
         return pd.DataFrame()
     
-    df = group_df.copy()
-    df["target_full"] = df["date"] + pd.Timedelta(days=h_full)
+    # Compute target dates without modifying original dataframe
+    target_full = group_df["date"] + pd.Timedelta(days=h_full)
     cutoff_limit = cutoff_target - pd.Timedelta(days=1)
     
     # Filter rows using vectorized operations
-    mask = (df["target_full"] <= cutoff_limit) & df[return_col].notna()
-    filtered = df.loc[mask]
+    mask = (target_full <= cutoff_limit) & group_df[return_col].notna()
+    filtered = group_df.loc[mask]
+    target_full_filtered = target_full.loc[mask]
     
     if filtered.empty:
         return pd.DataFrame()
@@ -146,7 +136,7 @@ def build_terms_weekly_for_day(group_df, retrain_horizons, cutoff_target):
         "window_days": filtered["window_days"].astype(int),
         "base_date": filtered["date"].dt.date.astype(str),
         "horizon_h": h_full,
-        "target_date": filtered["target_full"].dt.date.astype(str),
+        "target_date": target_full_filtered.dt.date.astype(str),
         "return_value": filtered[return_col].astype(float),
         "factor": 1.0 + filtered[return_col].astype(float),
         "source": "validacao_semanal"
@@ -163,13 +153,13 @@ def build_terms_ret_diario(dsel, stop_date):
     if subset.empty:
         return pd.DataFrame()
     
-    # Vectorized approach: compute all target dates at once
-    df = subset.copy()
-    df["target_date_ts"] = df["date"] + pd.Timedelta(days=1)
+    # Compute target dates without modifying original dataframe
+    target_date_ts = subset["date"] + pd.Timedelta(days=1)
     
     # Filter rows using vectorized operations
-    mask = (df["target_date_ts"].dt.date <= stop_date) & df["return_daily_t+1"].notna()
-    filtered = df.loc[mask]
+    mask = (target_date_ts.dt.date <= stop_date) & subset["return_daily_t+1"].notna()
+    filtered = subset.loc[mask]
+    target_date_filtered = target_date_ts.loc[mask]
     
     if filtered.empty:
         return pd.DataFrame()
@@ -179,7 +169,7 @@ def build_terms_ret_diario(dsel, stop_date):
         "window_days": filtered["window_days"].astype(int),
         "base_date": filtered["date"].dt.date.astype(str),
         "horizon_h": 1,
-        "target_date": filtered["target_date_ts"].dt.date.astype(str),
+        "target_date": target_date_filtered.dt.date.astype(str),
         "return_value": filtered["return_daily_t+1"].astype(float),
         "factor": 1.0 + filtered["return_daily_t+1"].astype(float),
         "source": "ret_diario"

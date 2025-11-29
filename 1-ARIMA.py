@@ -24,7 +24,7 @@ def prepare_series(df: pd.DataFrame):
     s = df.set_index("Date")["Open"].copy()
     s = pd.to_numeric(s, errors="coerce").dropna()
     s_pos = s[s > 0].copy()
-    s_pos.index = s_pos.index.normalize()
+    # Index is already normalized in read_btc_csv, no need to normalize again
     s_log = np.log(s_pos)
     return s_pos, s_log
 
@@ -98,13 +98,16 @@ def main():
     rows = []
     eval_dates = s_pos.index[(s_pos.index >= start_date) & (s_pos.index <= end_date)]
 
+    # Optimization: Convert Series to dict for O(1) lookups instead of O(n) index checks
+    s_pos_dict = s_pos.to_dict()
+
     for current_day in eval_dates:
         dow = int(current_day.weekday())
         train_series_log = s_log.loc[:current_day]
         if len(train_series_log) < 2:
             continue
 
-        open_t = float(s_pos.loc[current_day])
+        open_t = s_pos_dict.get(current_day, np.nan)
         if not np.isfinite(open_t) or open_t <= 0:
             continue
 
@@ -126,7 +129,7 @@ def main():
                 row[f"forecast_t+{h}"] = y_hat
 
                 future_day = current_day + timedelta(days=h)
-                real_future = float(s_pos.loc[future_day]) if future_day in s_pos.index else np.nan
+                real_future = s_pos_dict.get(future_day, np.nan)
                 row[f"real_t+{h}"] = real_future
 
                 # Inicializa outputs para evitar KeyError
@@ -147,7 +150,7 @@ def main():
 
                 # Sinal/retorno daily
                 prev_day = current_day + timedelta(days=h - 1)
-                prev_open = float(s_pos.loc[prev_day]) if prev_day in s_pos.index else np.nan
+                prev_open = s_pos_dict.get(prev_day, np.nan)
                 if np.isfinite(y_hat) and np.isfinite(prev_open) and prev_open > 0:
                     signal_daily = 1 if y_hat >= prev_open else -1
                     row[f"signal_daily_t+{h}"] = int(signal_daily)
@@ -164,8 +167,8 @@ def main():
 
                 prev_day_k = current_day + timedelta(days=k - 1)
                 day_k = current_day + timedelta(days=k)
-                prev_open_k = float(s_pos.loc[prev_day_k]) if prev_day_k in s_pos.index else np.nan
-                open_k = float(s_pos.loc[day_k]) if day_k in s_pos.index else np.nan
+                prev_open_k = s_pos_dict.get(prev_day_k, np.nan)
+                open_k = s_pos_dict.get(day_k, np.nan)
 
                 if np.isfinite(forecast_t7) and np.isfinite(prev_open_k) and prev_open_k > 0:
                     sig_vs_f7 = 1 if forecast_t7 >= prev_open_k else -1

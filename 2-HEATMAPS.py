@@ -119,6 +119,7 @@ def compute_comp_metric(df_terms: pd.DataFrame, label: str):
     df_sorted = df_terms.sort_values(["window_days", "target_date", "horizon_h"])
     
     records = []
+    # sort=False avoids redundant re-sorting since data is already sorted by window_days
     for w, group in df_sorted.groupby("window_days", sort=False):
         # Group is already sorted by target_date, horizon_h due to pre-sorting
         comp_ret = product_return(group["return_value"])
@@ -465,9 +466,8 @@ def render_period(df, daily_horizons, retrain_horizons, period_start, period_end
             )
             for col in combined_heat.columns
         }
-        # Use vectorized subtraction with pd.Series for better performance
-        btc_values = pd.Series([btc_map_numeric.get(col, np.nan) for col in combined_heat.columns], 
-                               index=combined_heat.columns)
+        # Use pandas Series alignment for efficient vectorized subtraction
+        btc_values = pd.Series(btc_map_numeric, index=combined_heat.columns)
         diff_heat = combined_heat.subtract(btc_values, axis=1)
         norm_diff = make_norm(diff_heat.values.flatten())
         annot_diff = diff_heat.map(format_return_pct)
